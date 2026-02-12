@@ -279,12 +279,28 @@ class Executar extends Command
             $cvdw->conectar();
 
             foreach ($objetosArray as $objeto => $dados) {
+
+                // NOVO: Se circuit breaker está aberto, aguardar recuperação
+                if ($this->rateLimitObj->circuitoEstaAberto()) {
+                    $console->warning([
+                        'Circuit breaker ABERTO — aguardando recuperação antes de: ' . $dados['nome'],
+                        'Status: ' . $this->rateLimitObj->getCircuitBreakerStatus(),
+                    ]);
+                    // Aguarda o tempo de recuperação (2min)
+                    sleep(120);
+                    // Verifica novamente (circuitoEstaAberto() reseta se passou o tempo)
+                    if ($this->rateLimitObj->circuitoEstaAberto()) {
+                        $console->error('Circuit breaker ainda aberto. Pulando: ' . $dados['nome']);
+                        continue;
+                    }
+                    $console->text('<fg=green>Circuit breaker fechado. Retomando...</>');
+                }
+
                 $objeto = $objetoObj->retornarObjeto($objeto);
                 $console->section($dados['nome']);
                 $console->text('Executando objeto: ' . $dados['nome'] . '');
 
                 $cvdw->processar($objeto, $this->qtd, $console, $this->apartir, $inputDataReferencia, $this->logObjeto, $this->maxpag);
-
             }
         } else {
             $console->error('Objeto não especificado.');
