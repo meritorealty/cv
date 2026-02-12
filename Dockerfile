@@ -23,6 +23,7 @@ RUN php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" \
 
 COPY ./docker/env.tmpl.ini /app/src/envs/env.tmpl.ini
 COPY ./docker/crontab /etc/crontabs/root
+RUN echo "" >> /etc/crontabs/root
 COPY . /app
 
 RUN composer install \
