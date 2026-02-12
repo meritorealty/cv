@@ -109,6 +109,16 @@ class Cvdw
         $this->alterados = $this->alteradoserros = 0;
 
         $resposta = $http->requestCVDW($objeto['path'], false, $this, $parametros);
+
+        // NOVO: Tratar retorno null (circuit breaker, 405, retries esgotados)
+        if ($resposta === null) {
+            $console->warning([
+                'Requisição inicial falhou para: ' . $objeto['path'],
+                'Endpoint será ignorado nesta execução.',
+            ]);
+            return false;
+        }
+
         $resposta = $this->corrigeRetornoJson($resposta);
 
         // Se não existir $resposta->total_de_registros, imprimir uma mensagem de erro;
@@ -155,6 +165,13 @@ class Cvdw
                             $parametros['a_partir_data_referencia'] = $referenciaData;
                         }
                         $resposta = $http->requestCVDW($objeto['path'], $progressBar, $this, $parametros, $inputDataReferencia);
+
+                        // NOVO: Tratar retorno null (circuit breaker, 405, retries esgotados)
+                        if ($resposta === null) {
+                            $console->warning('Requisição falhou na página ' . $pagina . '. Interrompendo este objeto.');
+                            break;
+                        }
+
                         if (isset($resposta->total_de_paginas)) {
                             $this->paginasEncontradas = $resposta->total_de_paginas;
                         }
