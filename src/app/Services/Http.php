@@ -41,129 +41,210 @@ class Http
         $this->executarObj = $executarObj;
         $this->ratelimitObj = $rateLimitObj;
         $this->environmentManager = new EnvironmentManager();
-
     }
 
     public function requestCVDW(string $path, $progressBar, $cvdw, array $parametros = [], bool $novaTentativa = true)
     {
-
         $this->ratelimitObj->validarTempoExecucao();
 
-        $segundos = $this->gerenciarRateLimit($cvdw, $progressBar);
-        if ($segundos > 0 && ! $progressBar) {
-            $this->aguardarSemProgresso($segundos);
+        // NOVO: Circuit breaker — se aberto, retorna null para pular
+        if ($this->ratelimitObj->circuitoEstaAberto()) {
+            $this->console->warning([
+                'Circuit breaker ABERTO — pulando requisição para ' . $path,
+                'Status: ' . $this->ratelimitObj->getCircuitBreakerStatus(),
+            ]);
+            return null;
         }
 
+        // NOVO: Sliding window + intervalo mínimo (substitui gerenciarRateLimit antigo)
+        $this->ratelimitObj->aguardarSeNecessario();
 
+        // Exibir info de rate limit na progress bar (mantém UX original)
         if ($progressBar) {
-            $this->aguardar($cvdw, $progressBar, $segundos);
+            $this->tempodeexecucao = $this->ratelimitObj->tempoDeExecucao();
+            $mensagem = "\n <fg=blue>Tempo de execução: " . $this->tempodeexecucao . " segundos</>";
+            $mensagem .= "\n <fg=gray>Rate limiter ativo (18req/min, intervalo 3.5s)</>";
+            $mensagem .= "\n <fg=gray>CB: " . $this->ratelimitObj->getCircuitBreakerStatus() . "</>";
+            $mensagem = $cvdw->getMensagem($mensagem);
+            $progressBar->setMessage($mensagem);
+            $progressBar->display();
         }
 
         $idrequisicao = $this->ratelimitObj->inserirRequisicao($path);
+        $this->ratelimitObj->registrarRequisicaoMemoria();
 
         $cabecalho = [
-            'email: '. $this->environmentManager->getCvEmail() .'',
+            'email: ' . $this->environmentManager->getCvEmail() . '',
             'token: ' . $this->environmentManager->getCvToken() . '',
             $this::HEADER_CONTENT_TYPE,
         ];
 
-        $url = $this::PROTOCOLO_HTTP . $this->environmentManager->getCvUrl() . '.cvcrm.com.br/api/v1/cvdw'. $path;
+        $url = $this::PROTOCOLO_HTTP . $this->environmentManager->getCvUrl() . '.cvcrm.com.br/api/v1/cvdw' . $path;
 
-        $curl = curl_init();
-        $verbose = fopen('php://temp', 'w+');
-        curl_setopt_array(
-            $curl,
-            [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_ENCODING => '',
-            CURLOPT_MAXREDIRS => 10,
-            CURLOPT_CONNECTTIMEOUT => 10,
-            CURLOPT_TIMEOUT => 40,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
-            CURLOPT_CUSTOMREQUEST => 'GET',
-            CURLOPT_POSTFIELDS => json_encode($parametros),
-            CURLOPT_HTTPHEADER => $cabecalho,
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => false,
-            CURLOPT_VERBOSE => true,
-            CURLOPT_STDERR => $verbose]
-        );
-        $response = curl_exec($curl);
+        // ============================================================
+        // NOVO: Loop de retry com backoff exponencial
+        // ============================================================
+        $maxRetries = 5;
+        $tentativa = 0;
+        $httpCode = 0;
+        $response = '';
 
-        $responseJson = json_decode($response);
+        while ($tentativa <= $maxRetries) {
+            $curl = curl_init();
+            $verbose = fopen('php://temp', 'w+');
+            curl_setopt_array(
+                $curl,
+                [
+                    CURLOPT_URL => $url,
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_ENCODING => '',
+                    CURLOPT_MAXREDIRS => 10,
+                    CURLOPT_CONNECTTIMEOUT => 10,
+                    CURLOPT_TIMEOUT => 40,
+                    CURLOPT_FOLLOWLOCATION => true,
+                    CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+                    CURLOPT_CUSTOMREQUEST => 'GET',
+                    CURLOPT_POSTFIELDS => json_encode($parametros),
+                    CURLOPT_HTTPHEADER => $cabecalho,
+                    CURLOPT_SSL_VERIFYPEER => false,
+                    CURLOPT_SSL_VERIFYHOST => false,
+                    CURLOPT_VERBOSE => true,
+                    CURLOPT_STDERR => $verbose,
+                ]
+            );
 
-        // verifica se o cabecalho da requisicao esta entre 200 e 299
-        if (! curl_errno($curl)) {
-            $httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-            $httpCode = intval($httpCode);
+            $response = curl_exec($curl);
+            $httpCode = 0;
+
+            if (!curl_errno($curl)) {
+                $httpCode = intval(curl_getinfo($curl, CURLINFO_HTTP_CODE));
+            }
+
+            curl_close($curl);
+
+            $responseJson = json_decode($response);
+
+            // SUCESSO (2xx)
             if ($httpCode >= 200 && $httpCode <= 299) {
+                $this->ratelimitObj->registrarSucesso();
+                if (isset($responseJson->dados)) {
+                    $dadosRetornoQtd = count($responseJson->dados);
+                } else {
+                    $dadosRetornoQtd = null;
+                }
+                $this->ratelimitObj->concluirRequisicao($idrequisicao, $dadosRetornoQtd, $httpCode);
                 return $responseJson;
             }
-        }
 
-        if ($this->output->isDebug() || $this->input->getOption('verbose')) {
-            rewind($verbose);
-            $verboseLog = stream_get_contents($verbose);
-            $verboseLog = "Verbose information:\n". htmlspecialchars($verboseLog);
-            $this->console->info([
-                'URL: ' . $url,
-                'Parametros: ' . json_encode($parametros),
-                'Resposta: ' . $response,
-                'Verbose: ' . $verboseLog,
-            ]);
-        }
+            // Debug verbose
+            if ($this->output->isDebug() || $this->input->getOption('verbose')) {
+                rewind($verbose);
+                $verboseLog = stream_get_contents($verbose);
+                $this->console->info([
+                    'URL: ' . $url,
+                    'HTTP Code: ' . $httpCode,
+                    'Tentativa: ' . ($tentativa + 1) . '/' . ($maxRetries + 1),
+                    'Resposta: ' . $response,
+                ]);
+            }
 
-        curl_close($curl);
+            // =====================================================
+            // HTTP 429 — Too Many Requests (CORREÇÃO PRINCIPAL)
+            // =====================================================
+            if ($httpCode === 429 || (isset($responseJson->Response) && $responseJson->Response == $this::RESPONSE_TOO_MANY_REQUESTS)) {
 
-        if (isset($responseJson->dados)) {
-            $dadosRetornoQtd = count($responseJson->dados);
-        } else {
-            $dadosRetornoQtd = null;
-        }
-        $this->ratelimitObj->concluirRequisicao($idrequisicao, $dadosRetornoQtd, null);
+                $tentativa++;
 
+                // Backoff exponencial: 60s, 120s, 240s... (cap 300s)
+                $baseWait = 60; // MÍNIMO 60s — bloqueio documentado da API
+                $waitTime = $baseWait * pow(2, $tentativa - 1);
+                $jitter = $waitTime * 0.15 * (mt_rand() / mt_getrandmax() * 2 - 1);
+                $waitTime = (int) min($waitTime + $jitter, 300);
 
-        // Se nao for setado $resposta->total_de_registros,
-        // imprimir uma mensagem de erro e tentar novamente em 3 segundos
-        if (! isset($responseJson->pagina) && $novaTentativa) {
-            $segundos = 3;
+                $this->console->warning([
+                    "HTTP 429 — Rate limit excedido (tentativa {$tentativa}/{$maxRetries})",
+                    "Aguardando {$waitTime}s antes de tentar novamente...",
+                    "CB: " . $this->ratelimitObj->getCircuitBreakerStatus(),
+                ]);
+
+                // Registrar falha no circuit breaker
+                $podeContinuar = $this->ratelimitObj->registrarFalha429();
+                if (!$podeContinuar) {
+                    $this->console->error([
+                        'Circuit breaker ABERTO após ' . $tentativa . ' falhas 429 consecutivas.',
+                        'Pulando para o próximo endpoint. Recuperação em 2 minutos.',
+                    ]);
+                    $this->ratelimitObj->concluirRequisicao($idrequisicao, null, $httpCode);
+                    return null;
+                }
+
+                // Aguardar com countdown na progress bar
+                if ($progressBar) {
+                    for ($i = $waitTime; $i > 0; $i--) {
+                        $msg = " <fg=red>429 — Aguardando {$i}s (tentativa {$tentativa}/{$maxRetries})...</>";
+                        $msg = $cvdw->getMensagem($msg);
+                        $progressBar->setMessage($msg);
+                        $progressBar->display();
+                        sleep(1);
+                    }
+                } else {
+                    sleep($waitTime);
+                }
+
+                // Registrar nova requisição no sliding window antes de retentar
+                $this->ratelimitObj->aguardarSeNecessario();
+                $this->ratelimitObj->registrarRequisicaoMemoria();
+
+                continue; // Volta pro while
+            }
+
+            // =====================================================
+            // HTTP 405 — Method Not Allowed (endpoint depreciado)
+            // =====================================================
+            if ($httpCode === 405) {
+                $this->console->error([
+                    "HTTP 405 — Endpoint possivelmente depreciado: {$path}",
+                    "Verifique se a URL usa /api/v1/ (não /api/cvio/)",
+                    "Pulando este endpoint.",
+                ]);
+                $this->ratelimitObj->concluirRequisicao($idrequisicao, null, $httpCode);
+                return null;
+            }
+
+            // =====================================================
+            // Outros erros — retry genérico com backoff menor
+            // =====================================================
+            $tentativa++;
+            if ($tentativa > $maxRetries) {
+                break;
+            }
+
+            $waitTime = min(10 * $tentativa, 60);
             $this->console->error([
                 $this::ERRO_REQUISICAO,
-                'Vamos tentar novamente em '.$segundos.' segundos...',
+                "HTTP {$httpCode} — Tentativa {$tentativa}/{$maxRetries}",
+                "Aguardando {$waitTime}s...",
             ]);
-            sleep($segundos);
-            $this->requestCVDW($path, $progressBar, $cvdw, $parametros, false);
+            sleep($waitTime);
         }
 
-        if (isset($responseJson->Response) && $responseJson->Response == $this::RESPONSE_TOO_MANY_REQUESTS) {
-            $this->console->error([
-                $this::ERRO_REQUISICAO,
-                $this::ERRO_BLOQUEIO,
-                $this::TENTAR_NOVAMENTE,
-                $response,
-            ]);
+        // Esgotou todas as tentativas
+        $this->console->error([
+            $this::ERRO_REQUISICAO,
+            "Todas as {$maxRetries} tentativas falharam para: {$path}",
+            $response,
+        ]);
+        $this->ratelimitObj->concluirRequisicao($idrequisicao, null, $httpCode);
 
-            return $this->console;
-        }
-
-        if (isset($responseJson->total_de_registros) && $responseJson->total_de_registros !== null) {
-            return $responseJson;
-        } else {
-
-            $this->console->error([
-                $this::ERRO_REQUISICAO,
-                $response,
-            ]);
-
-            return $this->console;
-        }
+        return null;
     }
 
+    /**
+     * @deprecated Substituído por $this->ratelimitObj->aguardarSeNecessario()
+     * Mantido para não quebrar eventuais chamadas externas.
+     */
     public function gerenciarRateLimit($cvdw, $progressBar): int
     {
-
         $diferenca = $this->ratelimitObj->getDiferencaSegundosUltimaRequisicao();
         $requisicoes = $this->ratelimitObj->qtdRequisicoes(60);
 
@@ -175,8 +256,8 @@ class Http
 
         if ($progressBar && $requisicoes > 1) {
             $mensagem = null;
-            $mensagem = "\n <fg=blue>Tempo de execução: ".$this->tempodeexecucao." segundos</>";
-            $mensagem .= "\n <fg=blue>Você fez " . $requisicoes .  " requisições no último minuto...</>";
+            $mensagem = "\n <fg=blue>Tempo de execução: " . $this->tempodeexecucao . " segundos</>";
+            $mensagem .= "\n <fg=blue>Você fez " . $requisicoes . " requisições no último minuto...</>";
             $mensagem .= "\n <fg=gray>Proteção contra o Rate Limit do servidor. (20req/min)</>";
             $mensagem = $cvdw->getMensagem($mensagem);
             $progressBar->setMessage($mensagem);
@@ -192,12 +273,13 @@ class Http
         }
 
         return $esperar;
-
     }
 
+    /**
+     * @deprecated Countdown agora é feito dentro de requestCVDW
+     */
     public function aguardar($cvdw, $progressBar, int $segundos = 3): void
     {
-
         $mensagem = null;
         for ($i = $segundos; $i > 0; $i--) {
             if ($i == 1) {
@@ -214,6 +296,9 @@ class Http
         $progressBar->setMessage($cvdw->getMensagem($mensagem));
     }
 
+    /**
+     * @deprecated Countdown agora é feito dentro de requestCVDW
+     */
     protected function aguardarSemProgresso(int $segundos): void
     {
         $this->console->text("");
@@ -226,12 +311,11 @@ class Http
             }
             sleep(1);
         }
-        $this->console->text(['','']);
+        $this->console->text(['', '']);
     }
 
     public function pingAmbienteCVDW(string $enderecoCv): array
     {
-
         $cabecalho = [
             $this::HEADER_CONTENT_TYPE,
         ];
@@ -284,7 +368,6 @@ class Http
 
     public function pingAmbienteAutenticadoCVDW(string $ambienteCv, string $path, string $email, string $token)
     {
-
         $cabecalho = [
             'email: ' . $email . '',
             'token: ' . $token . '',
@@ -334,7 +417,6 @@ class Http
         if (isset($responseJson['registros']) && $responseJson['registros'] !== null) {
             return $responseJson;
         } else {
-
             $this->console->error([
                 'Erro ao tentar fazer a requisição.',
                 $response,
@@ -346,8 +428,8 @@ class Http
 
     public function buscarVersaoRepositorio()
     {
-        $repo = 'manzano/cvdw-cli'; // Altere para o usuário/repositorio desejado
-        $url = $this::PROTOCOLO_HTTP."api.github.com/repos/$repo/releases/latest";
+        $repo = 'manzano/cvdw-cli';
+        $url = $this::PROTOCOLO_HTTP . "api.github.com/repos/$repo/releases/latest";
         $curl = curl_init();
         $cabecalho = ['User-Agent: Github / CVDW-CLI', 'Accept: application/json'];
         $verbose = fopen('php://temp', 'w+');
@@ -375,7 +457,7 @@ class Http
 
         if ($response) {
             $data = json_decode($response, true);
-            if (! isset($data['tag_name'])) {
+            if (!isset($data['tag_name'])) {
                 return "OFF";
             }
 
@@ -383,7 +465,5 @@ class Http
         } else {
             return "OFF";
         }
-
     }
-
 }
